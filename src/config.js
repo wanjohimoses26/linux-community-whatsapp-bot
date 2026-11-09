@@ -16,7 +16,8 @@ const schema = z.object({
   MAX_AI_QUEUE: z.coerce.number().int().min(1).max(100).default(20),
   MAX_MESSAGE_CHARS: z.coerce.number().int().min(500).max(10000).default(4096),
   DM_MEMBER_CACHE_TTL_MS: z.coerce.number().int().positive().default(14400000),
-  HEALTH_TOKEN: z.string().optional()
+  HEALTH_TOKEN: z.string().optional(),
+  PAIR_TOKEN: z.string().optional()
 }).passthrough();
 
 const raw = schema.parse(process.env);
