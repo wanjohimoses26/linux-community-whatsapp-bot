@@ -79,9 +79,10 @@ create table if not exists questions (
   answer text,
   posted_at timestamptz not null default now(),
   closes_at timestamptz not null,
-  status text not null default 'active' check (status in ('active','closed','cancelled')),
-  unique (group_id, status) deferrable initially immediate
+  status text not null default 'active' check (status in ('active','closed','cancelled'))
 );
+create unique index if not exists questions_one_active_per_group_idx
+  on questions(group_id) where status = 'active';
 
 create table if not exists ctf_challenges (
   id uuid primary key default gen_random_uuid(),
