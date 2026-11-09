@@ -48,7 +48,11 @@ const safeNext = (value) => ['/pair', '/setup'].includes(value) ? value : '/';
 const loginPage = (next, error = '') => `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Secure bot login</title><style>body{font-family:system-ui;max-width:460px;margin:12vh auto;padding:20px;background:#f7f9fb;color:#17202a}main{background:#fff;padding:28px;border-radius:16px;box-shadow:0 8px 30px #17202a12}input,button{width:100%;box-sizing:border-box;padding:12px;margin-top:8px;border-radius:8px}input{border:1px solid #ccd5df}button{border:0;background:#1769aa;color:#fff;font-weight:700}.error{color:#b42318}</style></head><body><main><h1>Secure bot dashboard</h1><p>Enter the dashboard password to continue.</p>${error ? `<p class="error">${esc(error)}</p>` : ''}<form method="post" action="/login"><input type="hidden" name="next" value="${esc(next)}"><input type="password" name="password" autocomplete="current-password" required autofocus><button type="submit">Sign in</button></form></main></body></html>`;
 
 async function participatingGroups() {
-  return socket?.groupFetchAllParticipating ? await socket.groupFetchAllParticipating() : {};
+  if (lastConnection !== 'open' || !socket?.groupFetchAllParticipating) return {};
+  return Promise.race([
+    socket.groupFetchAllParticipating(),
+    new Promise((resolve) => setTimeout(() => resolve({}), 5_000))
+  ]);
 }
 
 app.get('/health', (req, res) => {
@@ -80,7 +84,7 @@ app.get('/setup', async (req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   if (!settingsStore) return res.status(503).send('Secure settings storage is not ready.');
   try {
-    const groups = socket?.groupFetchAllParticipating ? await socket.groupFetchAllParticipating() : {};
+    const groups = await participatingGroups();
     const savedGroups = await settingsStore.list('group_map');
     const savedKeys = await settingsStore.list('ai_keys');
     const options = Object.entries(groups).map(([id, group]) => `<option value="${esc(id)}">${esc(group.subject || id)} (${esc(id)})</option>`).join('');
