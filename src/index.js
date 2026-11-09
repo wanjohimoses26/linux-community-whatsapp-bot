@@ -30,6 +30,12 @@ const aiRouter = settingsStore ? new ProviderRouter({ settings: settingsStore, l
 
 const esc = (value = '') => String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 const roleNames = ['announcements', 'open_chat', 'cyber', 'help', 'distro', 'projects'];
+const setupOwners = new Set();
+const setupGroupLists = new Map();
+
+async function participatingGroups() {
+  return socket?.groupFetchAllParticipating ? await socket.groupFetchAllParticipating() : {};
+}
 
 app.get('/health', (req, res) => {
   if (config.HEALTH_TOKEN && req.get('x-health-token') !== config.HEALTH_TOKEN) return res.sendStatus(401);
@@ -71,6 +77,43 @@ app.listen(config.PORT, () => logger.info({ port: config.PORT }, 'health server 
 router.command('help', async ({ send }) => send(cleanWhatsApp(`*${config.BOT_NAME} commands*\n!rank, !top, !start, !explain <command>, !privacy\nAsk a question with !ask <question>.`)));
 router.command('privacy', async ({ send }) => send('I store minimal metadata for moderation, XP, and operations. Raw message text is not kept as a long-term record. Ask an admin or use !stop to opt out of onboarding.'));
 router.command('start', async ({ send }) => send('Welcome. Start with one small Linux goal today, then ask in Help & Support if you get stuck.'));
+router.command('claim', async ({ args, send, isGroup, sender }) => {
+  if (isGroup) return;
+  if (!config.PAIR_TOKEN || args.trim() !== config.PAIR_TOKEN) return send('That setup code is not valid. Open the private setup link to get the current code.');
+  setupOwners.add(sender);
+  return send('Setup claimed for this DM. Send !groups and I will show every WhatsApp group I can see. I will not assign or post to any group until you choose it.');
+});
+router.command('groups', async ({ send, isGroup, sender }) => {
+  if (isGroup) return;
+  if (!setupOwners.has(sender)) return send('For safety, claim setup first with !claim <private setup code>.');
+  const groups = await participatingGroups();
+  const list = Object.entries(groups);
+  setupGroupLists.set(sender, list);
+  if (!list.length) return send('I cannot see any WhatsApp groups yet. Add the bot number to a group, then send !groups again.');
+  const lines = list.map(([id, group], index) => `${index + 1}. ${group.subject || id}`);
+  return send(`I can see these groups:\n\n${lines.join('\n')}\n\nChoose only the community groups. Reply like:\n!use 2 open_chat\n!use 5 cyber\n\nRoles: ${roleNames.join(', ')}\nUnassigned groups will be ignored.`);
+});
+router.command('use', async ({ args, send, isGroup, sender }) => {
+  if (isGroup) return;
+  if (!setupOwners.has(sender)) return send('For safety, claim setup first with !claim <private setup code>.');
+  if (!settingsStore) return send('Secure setup storage is not ready yet.');
+  const match = args.trim().match(/^(\d+)\s+(announcements|open_chat|cyber|help|distro|projects)$/i);
+  const list = setupGroupLists.get(sender) || [];
+  if (!match) return send('Use this format: !use <group number> <role>\nExample: !use 3 cyber');
+  const index = Number(match[1]) - 1;
+  if (!list[index]) return send('That group number is not in the last !groups list. Send !groups again.');
+  const [groupId, group] = list[index];
+  const role = match[2].toLowerCase();
+  await settingsStore.set('group_map', role, groupId);
+  return send(`Saved: ${group.subject || groupId} is now the ${role.replace('_', ' ')} group. Send !groups to review or !use another assignment.`);
+});
+router.command('done', async ({ send, isGroup, sender }) => {
+  if (isGroup) return;
+  if (!setupOwners.has(sender)) return send('For safety, claim setup first with !claim <private setup code>.');
+  setupOwners.delete(sender);
+  setupGroupLists.delete(sender);
+  return send('Setup complete. I will only use the groups you assigned. You can repeat the private claim flow later to change the mapping.');
+});
 router.command('ask', async ({ args, send }) => {
   if (!aiRouter) return send('AI setup is not ready yet. Open the private setup page and add a provider key.');
   if (!args.trim()) return send('Use !ask followed by your Linux question.');
