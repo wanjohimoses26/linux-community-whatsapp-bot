@@ -4,7 +4,7 @@ A safety-first foundation for the six-group Linux community bot. This repository
 
 ## Important operating decisions
 
-1. **Pairing is manual and one-time.** Do not deploy a real number until the production auth-state adapter encrypts Baileys credentials in Supabase. The current `.qr` adapter is development-only and must never be relied on across Render restarts.
+1. **Pairing is manual and one-time.** Production credentials are encrypted with AES-256-GCM before being stored in Supabase. The `.qr` adapter is development-only and is never used in production.
 2. **WhatsApp is not a durable job queue.** Every scheduled action needs a database claim/lease, an idempotency key, a retry limit, and a quiet-hours/daily-cap check. Never use an unbounded `setInterval` that can create duplicate posts after reconnects.
 3. **The bot never assumes it can delete, mute, kick, promote, or read group membership.** Those actions require the bot to be a group admin and must be tested against the actual Baileys version and WhatsApp behavior. Every failure becomes an audit event, not a retry loop.
 4. **Privacy is opt-in where possible.** Store hashes for member identity, avoid long-term raw messages, give a visible `!privacy` command, and make onboarding resumable and stoppable. Do not send unsolicited DMs in bulk until members have initiated contact or the community has explicitly agreed.
@@ -23,13 +23,13 @@ npm start
 
 The service exposes `GET /health` on `PORT`. In development, scan the printed Baileys QR. For production, replace `useMultiFileAuthState('.qr')` in `src/index.js` with an encrypted Supabase-backed auth adapter before pairing.
 
-Apply `supabase/schema.sql` in Supabase, then create the six group rows with stable WhatsApp group IDs. Do not use display names as identifiers; names change and are not unique.
+Apply `supabase/schema.sql` in Supabase, then create the six group rows with stable WhatsApp group IDs. Production additionally enables RLS on every table and requires the private `SUPABASE_BOT_SECRET` header gate. Do not use display names as identifiers; names change and are not unique.
 
 ## Build phases
 
 ### Phase 0: hardening before real traffic
 
-- Implement encrypted, versioned Supabase auth state with transactional writes.
+- Rotate the generated bot secret and auth-encryption key through Render if compromise is suspected; rotate auth only after planning a re-pair migration.
 - Add message receipt idempotency (`message_id` unique) before any side effect.
 - Add structured DB repositories with explicit timeouts and bounded queries.
 - Add a real scheduler based on persisted leases: `job_key`, `run_after`, `lease_until`, `attempts`, `last_error`.
@@ -85,6 +85,6 @@ Apply `supabase/schema.sql` in Supabase, then create the six group rows with sta
 
 ## Deployment
 
-Render should run one Node web service with the health endpoint monitored externally. Set environment variables from `.env.example`, use Supabase only for durable state, and configure an external health check no more often than needed to keep the service warm. Keep a rollback copy of the previous deploy and test reconnects after every deployment.
+Render runs one Node web service with the health endpoint monitored externally. The live service has `SUPABASE_URL`, `SUPABASE_API_KEY`, `SUPABASE_BOT_SECRET`, and `AUTH_ENCRYPTION_KEY` configured as environment variables. Supabase RLS is enabled on every bot table, and the bot's encrypted auth-state adapter has been exercised end-to-end against the live project. Keep a rollback copy of the previous deploy and test reconnects after every deployment.
 
 The original plan's “all free tiers” assumption is not a reliability guarantee. Provider quotas, WhatsApp enforcement, Render behavior, and Supabase limits change. Treat each as a budget with alerts and a safe fallback, not as unlimited capacity.
