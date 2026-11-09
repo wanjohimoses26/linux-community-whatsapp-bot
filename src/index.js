@@ -23,6 +23,9 @@ app.get('/health', (req, res) => {
   if (config.HEALTH_TOKEN && req.get('x-health-token') !== config.HEALTH_TOKEN) return res.sendStatus(401);
   res.json({ ok: lastConnection === 'open', connection: lastConnection, uptimeSec: Math.floor((Date.now() - startedAt) / 1000) });
 });
+app.get('/', (_req, res) => {
+  res.status(200).type('html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${config.BOT_NAME} Community Bot</title><style>body{font-family:system-ui,sans-serif;max-width:680px;margin:12vh auto;padding:24px;color:#17202a;background:#f7f9fb}main{background:#fff;border:1px solid #e3e8ed;border-radius:16px;padding:28px;box-shadow:0 8px 30px #17202a12}h1{margin-top:0}a{color:#1769aa;text-decoration:none}small{color:#607080}</style></head><body><main><h1>${config.BOT_NAME} Community Bot</h1><p>The service is online. WhatsApp connection status: <strong>${lastConnection}</strong>.</p><p><a href="/health">View health status</a></p><small>Linux community bot infrastructure</small></main></body></html>`);
+});
 app.listen(config.PORT, () => logger.info({ port: config.PORT }, 'health server listening'));
 
 router.command('help', async ({ send }) => send(cleanWhatsApp(`*${config.BOT_NAME} commands*\n!rank, !top, !start, !explain <command>, !privacy\nAsk a question with !ask <question>.`)));
