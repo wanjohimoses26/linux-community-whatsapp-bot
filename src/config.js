@@ -11,6 +11,8 @@ const schema = z.object({
   SUPABASE_API_KEY: z.string().min(1).optional(),
   SUPABASE_BOT_SECRET: z.string().min(1).optional(),
   AUTH_ENCRYPTION_KEY: z.string().min(1).optional(),
+  ADMIN_PASSWORD_HASH: z.string().min(1).optional(),
+  WEB_SESSION_SECRET: z.string().min(32).optional(),
   ADMIN_JIDS: z.string().optional(),
   OWNER_JID: z.string().optional(),
   MAX_AI_QUEUE: z.coerce.number().int().min(1).max(100).default(20),
