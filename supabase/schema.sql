@@ -139,5 +139,12 @@ create table if not exists ai_usage (
   primary key (provider, model, usage_day)
 );
 
+create table if not exists bot_auth (
+  key text primary key,
+  value text not null,
+  updated_at timestamptz not null default now()
+);
+create index if not exists bot_auth_updated_idx on bot_auth(updated_at);
+
 -- Keep operational data bounded. Schedule this with pg_cron or the application scheduler.
 -- Never delete active moderation records or CTF solve history automatically.

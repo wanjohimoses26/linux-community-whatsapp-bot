@@ -8,7 +8,9 @@ const schema = z.object({
   LOG_LEVEL: z.string().default('info'),
   BOT_NAME: z.string().min(1).max(32).default('Tux'),
   SUPABASE_URL: z.string().url().optional(),
-  SUPABASE_SERVICE_KEY: z.string().min(1).optional(),
+  SUPABASE_API_KEY: z.string().min(1).optional(),
+  SUPABASE_BOT_SECRET: z.string().min(1).optional(),
+  AUTH_ENCRYPTION_KEY: z.string().min(1).optional(),
   ADMIN_JIDS: z.string().optional(),
   OWNER_JID: z.string().optional(),
   MAX_AI_QUEUE: z.coerce.number().int().min(1).max(100).default(20),
@@ -26,5 +28,5 @@ export const config = Object.freeze({
     cyber: process.env.GROUP_CYBER || '', help: process.env.GROUP_HELP || '',
     distro: process.env.GROUP_DISTRO || '', projects: process.env.GROUP_PROJECTS || ''
   }),
-  supabaseEnabled: Boolean(raw.SUPABASE_URL && raw.SUPABASE_SERVICE_KEY)
+  supabaseEnabled: Boolean(raw.SUPABASE_URL && raw.SUPABASE_API_KEY && raw.SUPABASE_BOT_SECRET)
 });

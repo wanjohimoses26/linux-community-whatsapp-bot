@@ -6,6 +6,7 @@ import { Router } from './core/router.js';
 import { SlidingWindow } from './core/rate-limit.js';
 import { LoopGuard } from './core/loop-guard.js';
 import { cleanWhatsApp } from './core/cleaner.js';
+import { useSupabaseAuthState } from './core/supabase-auth.js';
 
 const logger = pino({ level: config.LOG_LEVEL, redact: ['req.headers.authorization', 'password', 'token', 'key'] });
 const app = express();
@@ -30,9 +31,15 @@ router.command('start', async ({ send }) => send('Welcome. Start with one small 
 
 async function connect() {
   const result = await guard.run('connect', async () => {
-    // This local auth state is deliberately a development fallback. Production must replace it
-    // with an encrypted Supabase-backed auth state before pairing a real number.
-    const { state, saveCreds } = await useMultiFileAuthState('.qr');
+    if (config.NODE_ENV === 'production' && (!config.supabaseEnabled || !config.AUTH_ENCRYPTION_KEY)) {
+      lastConnection = 'blocked';
+      logger.error('production startup blocked: encrypted Supabase auth requires SUPABASE_URL, SUPABASE_API_KEY, SUPABASE_BOT_SECRET, and AUTH_ENCRYPTION_KEY');
+      return;
+    }
+    const auth = config.NODE_ENV === 'production'
+      ? await useSupabaseAuthState({ url: config.SUPABASE_URL, apiKey: config.SUPABASE_API_KEY, botSecret: config.SUPABASE_BOT_SECRET, encryptionKey: config.AUTH_ENCRYPTION_KEY, logger })
+      : await useMultiFileAuthState('.qr');
+    const { state, saveCreds } = auth;
     socket = makeWASocket({ auth: state, logger: pino({ level: 'silent' }), markOnlineOnConnect: false, syncFullHistory: false });
     socket.ev.on('creds.update', saveCreds);
     socket.ev.on('connection.update', ({ connection, lastDisconnect }) => {
