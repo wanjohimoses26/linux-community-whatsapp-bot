@@ -9,11 +9,13 @@ import { LoopGuard } from './core/loop-guard.js';
 import { cleanWhatsApp } from './core/cleaner.js';
 import { useSupabaseAuthState } from './core/supabase-auth.js';
 import { createSettingsStore } from './core/settings.js';
+import { createAdminList, messageIds } from './core/admins.js';
 import { ProviderRouter } from './ai/providers.js';
-import { cookieHeader, cookieName, issueSession, parseCookies, validSession, verifyPassword, clearCookieHeader } from './core/web-auth.js';
+import { checkPassword, safeEqual, cookieHeader, cookieName, issueSession, parseCookies, validSession, clearCookieHeader } from './core/web-auth.js';
 
 const logger = pino({ level: config.LOG_LEVEL, redact: ['req.headers.authorization', 'password', 'token', 'key'] });
 const app = express();
+app.set('trust proxy', 1);
 app.use(express.urlencoded({ extended: false, limit: '64kb' }));
 app.use((_req, res, next) => {
   res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -23,6 +25,7 @@ app.use((_req, res, next) => {
   res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
   next();
 });
+
 const startedAt = Date.now();
 let socket;
 let reconnectTimer;
@@ -31,28 +34,48 @@ let lastConnection = 'starting';
 let latestQr = '';
 const guard = new LoopGuard({ minIntervalMs: 5_000 });
 const inboundLimit = new SlidingWindow({ limit: 30, windowMs: 60_000 });
+const aiLimit = new SlidingWindow({ limit: 5, windowMs: 60_000 });
+const claimLimit = new SlidingWindow({ limit: 5, windowMs: 15 * 60_000 });
+const webLoginLimit = new SlidingWindow({ limit: 5, windowMs: 15 * 60_000 });
 const router = new Router({ logger });
 const settingsStore = config.supabaseEnabled && config.AUTH_ENCRYPTION_KEY
   ? createSettingsStore({ url: config.SUPABASE_URL, apiKey: config.SUPABASE_API_KEY, botSecret: config.SUPABASE_BOT_SECRET, encryptionKey: config.AUTH_ENCRYPTION_KEY })
   : null;
 const aiRouter = settingsStore ? new ProviderRouter({ settings: settingsStore, logger }) : null;
+const admins = createAdminList({ settings: settingsStore, envJids: [...config.adminJids, config.OWNER_JID], logger });
+const paused = new Set(); // group JIDs, or 'ALL'
 
-const esc = (value = '') => String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
 const roleNames = ['announcements', 'open_chat', 'cyber', 'help', 'distro', 'projects'];
-const setupOwners = new Set();
-const setupGroupLists = new Map();
-const webLoginLimit = new SlidingWindow({ limit: 5, windowMs: 15 * 60_000 });
+const providerNames = ['groq', 'openrouter', 'gemini', 'kilo'];
+const roleLabel = (role) => role.replace('_', ' ');
 
-const webAuthed = (req) => Boolean(config.ADMIN_PASSWORD_HASH && config.WEB_SESSION_SECRET && validSession(parseCookies(req.headers.cookie)[cookieName()], config.WEB_SESSION_SECRET));
-const safeNext = (value) => ['/pair', '/setup'].includes(value) ? value : '/';
-const loginPage = (next, error = '') => `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Secure bot login</title><style>body{font-family:system-ui;max-width:460px;margin:12vh auto;padding:20px;background:#f7f9fb;color:#17202a}main{background:#fff;padding:28px;border-radius:16px;box-shadow:0 8px 30px #17202a12}input,button{width:100%;box-sizing:border-box;padding:12px;margin-top:8px;border-radius:8px}input{border:1px solid #ccd5df}button{border:0;background:#1769aa;color:#fff;font-weight:700}.error{color:#b42318}</style></head><body><main><h1>Secure bot dashboard</h1><p>Enter the dashboard password to continue.</p>${error ? `<p class="error">${esc(error)}</p>` : ''}<form method="post" action="/login"><input type="hidden" name="next" value="${esc(next)}"><input type="password" name="password" autocomplete="current-password" required autofocus><button type="submit">Sign in</button></form></main></body></html>`;
+async function loadPaused() {
+  if (!settingsStore) return;
+  try { for (const [key, value] of Object.entries(await settingsStore.list('paused'))) if (value) paused.add(key); }
+  catch (err) { logger.warn({ err }, 'could not load paused groups'); }
+}
+async function setPaused(key, value) {
+  if (value) paused.add(key); else paused.delete(key);
+  if (settingsStore) await settingsStore.set('paused', key, value);
+}
+
+// ---------- web pages ----------
+const esc = (value = '') => String(value).replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
+const css = 'body{font-family:system-ui,sans-serif;max-width:720px;margin:4vh auto;padding:16px;background:#f7f9fb;color:#17202a}main{background:#fff;padding:22px;border-radius:16px;box-shadow:0 8px 30px #17202a12}h1{margin-top:0}h2{margin:26px 0 6px;font-size:1.1rem}label{display:block;margin:10px 0;text-transform:capitalize}select,input{display:block;width:100%;box-sizing:border-box;padding:11px;margin-top:5px;border:1px solid #ccd5df;border-radius:8px}button,a.btn{display:inline-block;margin:14px 8px 0 0;padding:11px 16px;border:0;border-radius:8px;background:#1769aa;color:#fff;font-weight:700;text-decoration:none;font-size:1rem}.ok{color:#087443}.warn{color:#b54708}.hint{color:#607080}.err{color:#b42318}code{background:#eef2f6;padding:2px 6px;border-radius:5px}';
+const page = (title, body, head = '') => `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(title)}</title>${head}<style>${css}</style></head><body><main>${body}</main></body></html>`;
+const statusLine = () => lastConnection === 'open'
+  ? '<strong class="ok">Connected to WhatsApp</strong>'
+  : `<strong class="warn">Not connected to WhatsApp (${esc(lastConnection)})</strong>`;
+
+const webAuthed = (req) => Boolean(config.dashboardEnabled && validSession(parseCookies(req.headers.cookie)[cookieName()], config.sessionSecret));
+const safeNext = (value) => ['/pair', '/setup'].includes(value) ? value : '/setup';
+const loginPage = (next, error = '') => page('Bot login', `<h1>${esc(config.BOT_NAME)} admin</h1><p>Enter the admin password to continue.</p>${error ? `<p class="err">${esc(error)}</p>` : ''}<form method="post" action="/login"><input type="hidden" name="next" value="${esc(next)}"><input type="password" name="password" autocomplete="current-password" required autofocus><button type="submit">Sign in</button></form>`);
 
 async function participatingGroups() {
   if (lastConnection !== 'open' || !socket?.groupFetchAllParticipating) return {};
-  return Promise.race([
-    socket.groupFetchAllParticipating(),
-    new Promise((resolve) => setTimeout(() => resolve({}), 5_000))
-  ]);
+  try {
+    return await Promise.race([socket.groupFetchAllParticipating(), new Promise((resolve) => setTimeout(() => resolve({}), 8_000))]);
+  } catch (err) { logger.warn({ err }, 'could not fetch WhatsApp groups'); return {}; }
 }
 
 app.get('/health', (req, res) => {
@@ -61,37 +84,50 @@ app.get('/health', (req, res) => {
 });
 app.get('/login', (req, res) => res.type('html').send(loginPage(safeNext(req.query.next))));
 app.post('/login', (req, res) => {
-  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || 'unknown').split(',')[0].trim();
-  if (!config.ADMIN_PASSWORD_HASH || !config.WEB_SESSION_SECRET) return res.status(503).send('Dashboard authentication is not configured.');
-  if (!webLoginLimit.allow(ip)) return res.status(429).type('html').send(loginPage(safeNext(req.body.next), 'Too many attempts. Try again in 15 minutes.'));
-  if (!verifyPassword(String(req.body.password || ''), config.ADMIN_PASSWORD_HASH)) return res.status(401).type('html').send(loginPage(safeNext(req.body.next), 'Incorrect password.'));
-  res.setHeader('Set-Cookie', cookieHeader(issueSession(config.WEB_SESSION_SECRET)));
+  if (!config.dashboardEnabled) return res.status(503).type('html').send(page('Not set up', '<h1>Admin login is not set up</h1><p>In Render, open this service, go to <b>Environment</b>, and add <code>ADMIN_PASSWORD</code> (8+ characters). Then redeploy.</p>'));
+  if (!webLoginLimit.allow(req.ip)) return res.status(429).type('html').send(loginPage(safeNext(req.body.next), 'Too many attempts. Try again in 15 minutes.'));
+  if (!checkPassword(String(req.body.password || ''), { hash: config.ADMIN_PASSWORD_HASH, plain: config.ADMIN_PASSWORD })) return res.status(401).type('html').send(loginPage(safeNext(req.body.next), 'Incorrect password.'));
+  res.setHeader('Set-Cookie', cookieHeader(issueSession(config.sessionSecret)));
   res.redirect(safeNext(req.body.next));
 });
 app.get('/logout', (_req, res) => { res.setHeader('Set-Cookie', clearCookieHeader()); res.redirect('/'); });
 app.get('/', (_req, res) => {
-  res.status(200).type('html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${config.BOT_NAME} Community Bot</title><style>body{font-family:system-ui,sans-serif;max-width:680px;margin:12vh auto;padding:24px;color:#17202a;background:#f7f9fb}main{background:#fff;border:1px solid #e3e8ed;border-radius:16px;padding:28px;box-shadow:0 8px 30px #17202a12}h1{margin-top:0}a{display:inline-block;margin:6px 8px 6px 0;padding:10px 14px;border-radius:8px;background:#1769aa;color:#fff;text-decoration:none}small{display:block;margin-top:18px;color:#607080}</style></head><body><main><h1>${config.BOT_NAME} Community Bot</h1><p>The service is online. WhatsApp connection status: <strong>${lastConnection}</strong>.</p><a href="/login?next=/pair">Connect WhatsApp</a><a href="/login?next=/setup">Configure bot</a><a href="/health">Health status</a><a href="/logout">Sign out</a><small>Dashboard access is password-protected. Keep your password private.</small></main></body></html>`);
+  res.type('html').send(page(`${config.BOT_NAME} Community Bot`, `<h1>${esc(config.BOT_NAME)} Community Bot</h1><p>${statusLine()}</p><a class="btn" href="/login?next=/setup">Open admin panel</a><a class="btn" href="/health">Health</a>`));
 });
+
 app.get('/pair', async (req, res) => {
   if (!webAuthed(req)) return res.redirect('/login?next=/pair');
   res.setHeader('Cache-Control', 'no-store');
-  if (!latestQr) return res.status(202).type('html').send('<!doctype html><meta http-equiv="refresh" content="4"><meta name="viewport" content="width=device-width,initial-scale=1"><title>WhatsApp pairing</title><p>Waiting for a fresh QR code. Refreshing shortly…</p>');
+  if (lastConnection === 'open') return res.type('html').send(page('WhatsApp', `<h1>Already connected</h1><p class="ok">${esc(config.BOT_NAME)} is linked to WhatsApp.</p><a class="btn" href="/setup">Back to admin panel</a>`));
+  if (!latestQr) return res.status(202).type('html').send(page('WhatsApp pairing', '<h1>Getting a QR code...</h1><p class="hint">This page refreshes by itself.</p>', '<meta http-equiv="refresh" content="4">'));
   const image = await QRCode.toDataURL(latestQr, { errorCorrectionLevel: 'M', margin: 2, width: 320 });
-  res.type('html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta http-equiv="refresh" content="20"><title>Pair ${config.BOT_NAME}</title><style>body{font-family:system-ui,sans-serif;text-align:center;margin:5vh auto;padding:20px;background:#f7f9fb;color:#17202a}main{background:#fff;border-radius:16px;padding:24px;max-width:420px;margin:auto;box-shadow:0 8px 30px #17202a12}img{width:320px;max-width:100%;image-rendering:pixelated}li{text-align:left;margin:10px 0}</style></head><body><main><h1>Connect ${config.BOT_NAME}</h1><ol><li>Open WhatsApp on the spare bot phone.</li><li>Go to <b>Settings → Linked devices → Link a device</b>.</li><li>Scan the QR code below.</li></ol><img src="${image}" alt="WhatsApp pairing QR code"><p>This QR refreshes automatically. Keep this link private.</p></main></body></html>`);
+  res.type('html').send(page(`Pair ${config.BOT_NAME}`, `<h1>Connect ${esc(config.BOT_NAME)}</h1><ol><li>Open WhatsApp on the spare bot phone.</li><li>Go to <b>Settings, Linked devices, Link a device</b>.</li><li>Scan the QR code below.</li></ol><img style="width:320px;max-width:100%;image-rendering:pixelated" src="${image}" alt="WhatsApp pairing QR code"><p class="hint">The QR refreshes automatically. Keep this page private.</p>`, '<meta http-equiv="refresh" content="20">'));
 });
+
 app.get('/setup', async (req, res) => {
   if (!webAuthed(req)) return res.redirect('/login?next=/setup');
   res.setHeader('Cache-Control', 'no-store');
-  if (!settingsStore) return res.status(503).send('Secure settings storage is not ready.');
+  if (!settingsStore) return res.status(503).type('html').send(page('Setup', '<h1>Storage not ready</h1><p>The Supabase settings in Render are missing or incomplete.</p>'));
   try {
     const groups = await participatingGroups();
     const savedGroups = await settingsStore.list('group_map');
     const savedKeys = await settingsStore.list('ai_keys');
-    const options = Object.entries(groups).map(([id, group]) => `<option value="${esc(id)}">${esc(group.subject || id)} (${esc(id)})</option>`).join('');
-    const roleFields = roleNames.map((role) => `<label>${esc(role.replace('_', ' '))}<select name="${role}"><option value="">Not assigned</option>${options}</select></label>`).join('');
-    const savedNote = req.query.saved ? '<p class="ok">Saved securely. Group mapping and provider keys are encrypted in Supabase.</p>' : '';
-    res.type('html').send(`<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${esc(config.BOT_NAME)} setup</title><style>body{font-family:system-ui;max-width:760px;margin:5vh auto;padding:20px;background:#f7f9fb;color:#17202a}main{background:#fff;padding:24px;border-radius:16px;box-shadow:0 8px 30px #17202a12}label{display:block;margin:12px 0;text-transform:capitalize}select,input{display:block;width:100%;box-sizing:border-box;padding:11px;margin-top:5px;border:1px solid #ccd5df;border-radius:8px}button{margin-top:18px;padding:12px 18px;border:0;border-radius:8px;background:#1769aa;color:#fff;font-weight:700}.ok{color:#087443}.hint{color:#607080}</style></head><body><main><h1>${esc(config.BOT_NAME)} setup</h1><p class="hint">Choose which WhatsApp group plays each community role. Provider keys are encrypted before storage and are never displayed again.</p>${savedNote}<form method="post" action="/setup"><h2>Groups</h2>${roleFields}<h2>AI providers</h2><label>Groq API key<input type="password" name="groq" autocomplete="off"></label><label>OpenRouter API key<input type="password" name="openrouter" autocomplete="off"></label><label>Kilo API key<input type="password" name="kilo" autocomplete="off"></label><button type="submit">Save securely</button></form><p class="hint">Found ${Object.keys(groups).length} WhatsApp groups. <a href="/">Back to dashboard</a></p></main></body></html>`);
-  } catch (error) { logger.error({ err: error }, 'setup page failed'); res.status(500).send('Could not load setup data.'); }
+    const roleFields = roleNames.map((role) => {
+      const saved = savedGroups[role] || '';
+      const known = Object.entries(groups).map(([id, group]) => `<option value="${esc(id)}"${id === saved ? ' selected' : ''}>${esc(group.subject || id)}</option>`);
+      if (saved && !groups[saved]) known.unshift(`<option value="${esc(saved)}" selected>Saved group (${esc(saved.slice(0, 12))}...)</option>`);
+      return `<label>${esc(roleLabel(role))}<select name="${role}"><option value="">Not assigned</option>${known.join('')}</select></label>`;
+    }).join('');
+    const keyFields = providerNames.map((name) => `<label>${esc(name)} API key ${savedKeys[name] ? '<span class="ok">(saved, leave empty to keep)</span>' : '<span class="hint">(not set)</span>'}<input type="password" name="${name}" autocomplete="off"></label>`).join('');
+    const claim = config.PAIR_TOKEN
+      ? `<p>To become a bot admin, send this message to the bot in a private chat:</p><p><code>!claim ${esc(config.PAIR_TOKEN)}</code></p><p class="hint">${admins.count()} admin(s) registered so far.</p>`
+      : '<p class="warn">Add <code>PAIR_TOKEN</code> (any short secret word) in Render to enable admin commands in WhatsApp.</p>';
+    const connect = lastConnection === 'open' ? '' : '<a class="btn" href="/pair">Scan WhatsApp QR code</a>';
+    const groupNote = lastConnection === 'open'
+      ? `<p class="hint">The bot can see ${Object.keys(groups).length} WhatsApp group(s). Add the bot number to a group if one is missing, then reload this page.</p>`
+      : '<p class="warn">Connect WhatsApp first, then the group lists fill in.</p>';
+    res.type('html').send(page(`${config.BOT_NAME} admin`, `<h1>${esc(config.BOT_NAME)} admin panel</h1><p>${statusLine()}</p>${connect}${req.query.saved ? '<p class="ok">Saved.</p>' : ''}<h2>1. Make yourself admin</h2>${claim}<form method="post" action="/setup"><h2>2. Which group is which?</h2><p class="hint">You can also type <code>!setgroup cyber</code> inside a group as an admin.</p>${roleFields}<h2>3. AI keys (optional)</h2>${keyFields}<button type="submit">Save</button></form>${groupNote}<p><a href="/logout">Sign out</a></p>`));
+  } catch (error) { logger.error({ err: error }, 'setup page failed'); res.status(500).type('html').send(page('Error', '<h1>Could not load the admin panel</h1><p>Check the Render logs and try again.</p>')); }
 });
 app.post('/setup', async (req, res) => {
   if (!webAuthed(req)) return res.redirect('/login?next=/setup');
@@ -99,59 +135,57 @@ app.post('/setup', async (req, res) => {
   if (!settingsStore) return res.status(503).send('Secure settings storage is not ready.');
   try {
     for (const role of roleNames) if (req.body[role]) await settingsStore.set('group_map', role, req.body[role]);
-    for (const provider of ['groq', 'openrouter', 'kilo']) if (req.body[provider]?.trim()) await settingsStore.set('ai_keys', provider, req.body[provider].trim());
+    for (const provider of providerNames) if (req.body[provider]?.trim()) await settingsStore.set('ai_keys', provider, req.body[provider].trim());
     res.redirect('/setup?saved=1');
   } catch (error) { logger.error({ err: error }, 'setup save failed'); res.status(500).send('Could not save setup data.'); }
 });
 app.listen(config.PORT, () => logger.info({ port: config.PORT }, 'health server listening'));
 
-router.command('help', async ({ send }) => send(cleanWhatsApp(`*${config.BOT_NAME} commands*\n!rank, !top, !start, !explain <command>, !privacy\nAsk a question with !ask <question>.`)));
-router.command('privacy', async ({ send }) => send('I store minimal metadata for moderation, XP, and operations. Raw message text is not kept as a long-term record. Ask an admin or use !stop to opt out of onboarding.'));
+// ---------- WhatsApp commands ----------
+router.command('help', async ({ send }) => send(`*${config.BOT_NAME} commands*\n!ask <question> - ask a Linux question\n!start - a beginner first step\n!privacy - what I store`));
+router.command('privacy', async ({ send }) => send('I store minimal metadata for moderation, XP, and operations. Raw message text is not kept as a long-term record. Ask an admin if you want anything removed.'));
 router.command('start', async ({ send }) => send('Welcome. Start with one small Linux goal today, then ask in Help & Support if you get stuck.'));
-router.command('claim', async ({ args, send, isGroup, sender }) => {
-  if (isGroup) return;
-  if (!config.PAIR_TOKEN || args.trim() !== config.PAIR_TOKEN) return send('That setup code is not valid. Open the private setup link to get the current code.');
-  setupOwners.add(sender);
-  return send('Setup claimed for this DM. Send !groups and I will show every WhatsApp group I can see. I will not assign or post to any group until you choose it.');
-});
-router.command('groups', async ({ send, isGroup, sender }) => {
-  if (isGroup) return;
-  if (!setupOwners.has(sender)) return send('For safety, claim setup first with !claim <private setup code>.');
-  const groups = await participatingGroups();
-  const list = Object.entries(groups);
-  setupGroupLists.set(sender, list);
-  if (!list.length) return send('I cannot see any WhatsApp groups yet. Add the bot number to a group, then send !groups again.');
-  const lines = list.map(([id, group], index) => `${index + 1}. ${group.subject || id}`);
-  return send(`I can see these groups:\n\n${lines.join('\n')}\n\nChoose only the community groups. Reply like:\n!use 2 open_chat\n!use 5 cyber\n\nRoles: ${roleNames.join(', ')}\nUnassigned groups will be ignored.`);
-});
-router.command('use', async ({ args, send, isGroup, sender }) => {
-  if (isGroup) return;
-  if (!setupOwners.has(sender)) return send('For safety, claim setup first with !claim <private setup code>.');
-  if (!settingsStore) return send('Secure setup storage is not ready yet.');
-  const match = args.trim().match(/^(\d+)\s+(announcements|open_chat|cyber|help|distro|projects)$/i);
-  const list = setupGroupLists.get(sender) || [];
-  if (!match) return send('Use this format: !use <group number> <role>\nExample: !use 3 cyber');
-  const index = Number(match[1]) - 1;
-  if (!list[index]) return send('That group number is not in the last !groups list. Send !groups again.');
-  const [groupId, group] = list[index];
-  const role = match[2].toLowerCase();
-  await settingsStore.set('group_map', role, groupId);
-  return send(`Saved: ${group.subject || groupId} is now the ${role.replace('_', ' ')} group. Send !groups to review or !use another assignment.`);
-});
-router.command('done', async ({ send, isGroup, sender }) => {
-  if (isGroup) return;
-  if (!setupOwners.has(sender)) return send('For safety, claim setup first with !claim <private setup code>.');
-  setupOwners.delete(sender);
-  setupGroupLists.delete(sender);
-  return send('Setup complete. I will only use the groups you assigned. You can repeat the private claim flow later to change the mapping.');
-});
-router.command('ask', async ({ args, send }) => {
-  if (!aiRouter) return send('AI setup is not ready yet. Open the private setup page and add a provider key.');
+router.command('ask', async ({ args, send, sender }) => {
+  if (!aiRouter) return send('AI is not set up yet. An admin can add a key in the admin panel.');
   if (!args.trim()) return send('Use !ask followed by your Linux question.');
-  try { await send(cleanWhatsApp(await aiRouter.ask({ question: args.trim() }), { maxChars: config.MAX_MESSAGE_CHARS })); }
-  catch { await send('No AI provider is available right now. Add a provider key in the private setup page or try again later.'); }
+  if (!aiLimit.allow(sender)) return send('Give me a minute, then ask again.');
+  try { await send(await aiRouter.ask({ question: args.trim() })); }
+  catch { await send('I cannot answer right now. Try again in a bit.'); }
 });
 
+router.command('claim', async ({ args, send, isGroup, sender, ids }) => {
+  if (isGroup) return;
+  if (!config.PAIR_TOKEN) return send('Admin setup is not switched on yet. The owner needs to add PAIR_TOKEN in Render.');
+  if (!claimLimit.allow(sender)) return;
+  if (!safeEqual(args.trim(), config.PAIR_TOKEN)) return send('That code is not valid. The current code is shown in the admin panel.');
+  try { await admins.add(ids); } catch (err) { logger.error({ err }, 'could not save admin'); return send('I could not save that. Try again in a minute.'); }
+  return send('Done, you are an admin. Send !adminhelp to see what you can do.');
+});
+router.command('adminhelp', async ({ send }) => send(`*Admin commands*\n!status - how the bot is doing\n!setgroup <role> - run inside a group. Roles: ${roleNames.join(', ')}\n!pause / !resume - run inside a group to silence the bot there\n!pause all / !resume all - in a private chat, for every group`), { adminOnly: true });
+router.command('status', async ({ send }) => {
+  let mapped = {}; let keys = {};
+  try { if (settingsStore) { mapped = await settingsStore.list('group_map'); keys = await settingsStore.list('ai_keys'); } } catch { /* shown as empty */ }
+  const mappedText = roleNames.map((role) => `${mapped[role] ? 'yes' : 'no '} ${roleLabel(role)}`).join('\n');
+  return send(`*${config.BOT_NAME} status*\nWhatsApp: ${lastConnection}\nAdmins: ${admins.count()}\nPaused: ${paused.size ? [...paused].map((x) => (x === 'ALL' ? 'everything' : 'a group')).join(', ') : 'nothing'}\nAI keys: ${Object.keys(keys).join(', ') || 'none'}\n\n*Groups set up*\n${mappedText}`);
+}, { adminOnly: true });
+router.command('setgroup', async ({ args, send, isGroup, jid }) => {
+  if (!isGroup) return send('Send this inside the group you want to set, for example: !setgroup cyber');
+  const role = args.trim().toLowerCase().replace(/[\s-]+/g, '_');
+  if (!roleNames.includes(role)) return send(`Pick one of: ${roleNames.join(', ')}`);
+  if (!settingsStore) return send('Settings storage is not ready yet.');
+  try { await settingsStore.set('group_map', role, jid); } catch (err) { logger.error({ err }, 'setgroup failed'); return send('I could not save that. Try again in a minute.'); }
+  return send(`Done. This group is now the ${roleLabel(role)} group.`);
+}, { adminOnly: true });
+const pauseHandler = (value) => async ({ args, send, isGroup, jid }) => {
+  const all = args.trim().toLowerCase() === 'all';
+  if (!isGroup && !all) return send(`Use ${value ? '!pause' : '!resume'} inside a group, or ${value ? '!pause' : '!resume'} all.`);
+  try { await setPaused(all ? 'ALL' : jid, value); } catch (err) { logger.error({ err }, 'pause change failed'); return send('I could not save that. Try again in a minute.'); }
+  return send(value ? 'Okay, I will stay quiet there. Admins can still use commands. Send !resume to undo.' : 'Back on.');
+};
+router.command('pause', pauseHandler(true), { adminOnly: true });
+router.command('resume', pauseHandler(false), { adminOnly: true });
+
+// ---------- WhatsApp connection ----------
 async function connect() {
   const result = await guard.run('connect', async () => {
     if (config.NODE_ENV === 'production' && (!config.supabaseEnabled || !config.AUTH_ENCRYPTION_KEY)) {
@@ -193,13 +227,19 @@ async function handleMessage(message) {
   const text = message.message.conversation || message.message.extendedTextMessage?.text || '';
   if (!text) return;
   const isGroup = jid.endsWith('@g.us');
+  const ids = messageIds(message, isGroup);
+  const isAdmin = admins.has(ids);
+  if (!isAdmin && (paused.has('ALL') || paused.has(jid))) return;
   const send = async (textToSend) => {
     if (!textToSend || !socket) return;
-    await socket.sendMessage(jid, { text: cleanWhatsApp(textToSend, { maxChars: config.MAX_MESSAGE_CHARS }) });
+    const cleaned = cleanWhatsApp(textToSend, { maxChars: config.MAX_MESSAGE_CHARS });
+    if (cleaned) await socket.sendMessage(jid, { text: cleaned });
   };
-  await router.dispatch({ text, jid, sender, isGroup, isAdmin: config.adminJids.has(sender), send, message });
+  await router.dispatch({ text, jid, sender, ids, isGroup, isAdmin, send, message });
 }
 
 process.on('SIGTERM', async () => { clearTimeout(reconnectTimer); try { socket?.end?.(new Error('shutdown')); } finally { process.exit(0); } });
 process.on('SIGINT', () => process.emit('SIGTERM'));
-connect().catch((error) => logger.error({ err: error }, 'initial connection failed'));
+Promise.all([admins.load(), loadPaused()])
+  .catch(() => {})
+  .finally(() => connect().catch((error) => logger.error({ err: error }, 'initial connection failed')));

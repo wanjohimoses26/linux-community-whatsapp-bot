@@ -1,6 +1,7 @@
 const PROVIDERS = [
   { name: 'groq', url: 'https://api.groq.com/openai/v1/chat/completions', model: 'llama-3.1-8b-instant' },
   { name: 'openrouter', url: 'https://openrouter.ai/api/v1/chat/completions', model: 'openai/gpt-4o-mini' },
+  { name: 'gemini', url: 'https://generativelanguage.googleapis.com/v1beta/openai/chat/completions', model: 'gemini-2.0-flash' },
   { name: 'kilo', url: process.env.KILO_BASE_URL || '', model: process.env.KILO_MODEL || 'default' }
 ];
 

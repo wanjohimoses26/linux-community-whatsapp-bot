@@ -19,6 +19,15 @@ export function verifyPassword(password, encoded) {
   } catch { return false; }
 }
 
+const digest = (value) => crypto.createHash('sha256').update(String(value)).digest();
+export const safeEqual = (a, b) => crypto.timingSafeEqual(digest(a), digest(b));
+/** Accepts either a scrypt hash (preferred) or a plain passphrase kept in a Render env var. */
+export function checkPassword(input, { hash, plain } = {}) {
+  if (hash) return verifyPassword(input, hash);
+  if (plain) return safeEqual(input, plain);
+  return false;
+}
+
 const sign = (value, secret) => crypto.createHmac('sha256', secret).update(value).digest('base64url');
 export function issueSession(secret) {
   const payload = Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + SESSION_TTL_SECONDS })).toString('base64url');
@@ -26,8 +35,8 @@ export function issueSession(secret) {
 }
 export function validSession(cookie, secret) {
   try {
-    const [payload, signature] = cookie.split('.');
-    if (!payload || !signature || !crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(sign(payload, secret)))) return false;
+    const [payload, signature] = String(cookie || '').split('.');
+    if (!payload || !signature || !safeEqual(signature, sign(payload, secret))) return false;
     return JSON.parse(Buffer.from(payload, 'base64url').toString()).exp > Math.floor(Date.now() / 1000);
   } catch { return false; }
 }

@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import crypto from 'node:crypto';
 import { z } from 'zod';
 
 const csv = (value) => value ? value.split(',').map((x) => x.trim()).filter(Boolean) : [];
@@ -11,6 +12,8 @@ const schema = z.object({
   SUPABASE_API_KEY: z.string().min(1).optional(),
   SUPABASE_BOT_SECRET: z.string().min(1).optional(),
   AUTH_ENCRYPTION_KEY: z.string().min(1).optional(),
+  // Easiest option: a plain passphrase stored in Render. ADMIN_PASSWORD_HASH (scrypt) still works and wins if both are set.
+  ADMIN_PASSWORD: z.string().min(8).optional(),
   ADMIN_PASSWORD_HASH: z.string().min(1).optional(),
   WEB_SESSION_SECRET: z.string().min(32).optional(),
   ADMIN_JIDS: z.string().optional(),
@@ -23,8 +26,14 @@ const schema = z.object({
 }).passthrough();
 
 const raw = schema.parse(process.env);
+// The dashboard cookie secret no longer needs its own setting: derive it from the encryption key when absent.
+const sessionSecret = raw.WEB_SESSION_SECRET
+  || (raw.AUTH_ENCRYPTION_KEY ? crypto.createHmac('sha256', raw.AUTH_ENCRYPTION_KEY).update('dashboard-session-v1').digest('hex') : undefined);
+
 export const config = Object.freeze({
   ...raw,
+  sessionSecret,
+  dashboardEnabled: Boolean((raw.ADMIN_PASSWORD_HASH || raw.ADMIN_PASSWORD) && sessionSecret),
   adminJids: new Set(csv(raw.ADMIN_JIDS)),
   groups: Object.freeze({
     announcements: process.env.GROUP_ANNOUNCEMENTS || '', open: process.env.GROUP_OPEN_CHAT || '',

@@ -1,90 +1,56 @@
-# Linux Community WhatsApp Bot
+# Linux Community WhatsApp Bot ("Tux")
 
-A safety-first foundation for the six-group Linux community bot. This repository deliberately starts with a small, observable core: reconnect-safe Baileys lifecycle, health endpoint, command routing, rate limits, output cleaning, loop guards, and a privacy-conscious Supabase schema.
+A WhatsApp bot for the Linux community groups. It runs on Render, keeps its data in Supabase, and is managed from a simple admin web page plus a few WhatsApp commands.
 
-## Important operating decisions
+## What works today
 
-1. **Pairing is manual and one-time.** Production credentials are encrypted with AES-256-GCM before being stored in Supabase. The `.qr` adapter is development-only and is never used in production.
-2. **WhatsApp is not a durable job queue.** Every scheduled action needs a database claim/lease, an idempotency key, a retry limit, and a quiet-hours/daily-cap check. Never use an unbounded `setInterval` that can create duplicate posts after reconnects.
-3. **The bot never assumes it can delete, mute, kick, promote, or read group membership.** Those actions require the bot to be a group admin and must be tested against the actual Baileys version and WhatsApp behavior. Every failure becomes an audit event, not a retry loop.
-4. **Privacy is opt-in where possible.** Store hashes for member identity, avoid long-term raw messages, give a visible `!privacy` command, and make onboarding resumable and stoppable. Do not send unsolicited DMs in bulk until members have initiated contact or the community has explicitly agreed.
-5. **Admin actions are out-of-band or strongly authenticated.** Do not build a password-only chat login as the primary control plane. Prefer Render environment access plus a private admin endpoint or TOTP-backed, short-lived sessions. Never echo secrets into logs or group chats.
-6. **Security content is educational only.** The bot may support CTFs, labs, defensive troubleshooting, and authorized testing. It must refuse instructions targeting real systems, credentials, private data, or evasion.
+| Feature | Status |
+|---|---|
+| Stays connected to WhatsApp, reconnects by itself | Working |
+| Admin web page (connect WhatsApp, assign groups, add AI keys) | Working |
+| `!ask`, `!start`, `!privacy`, `!help` | Working |
+| Admin commands: `!status`, `!setgroup`, `!pause`, `!resume` | Working |
+| Moderation (anti-link, flood, warnings), welcome messages | Not built yet |
+| XP and ranks, daily questions, CTF, recaps | Not built yet |
 
-## Local setup
+The database tables for the not-built features already exist in `supabase/schema.sql`.
+
+## First-time setup (about 10 minutes)
+
+All settings live in **Render, your service, Environment**. Nothing secret goes in GitHub.
+
+1. Make sure these four are set (they should already be): `SUPABASE_URL`, `SUPABASE_API_KEY`, `SUPABASE_BOT_SECRET`, `AUTH_ENCRYPTION_KEY`. Also set `NODE_ENV` to `production`.
+2. Add **`ADMIN_PASSWORD`**: any passphrase of 8+ characters. This is your admin web page login.
+3. Add **`PAIR_TOKEN`**: any short secret word. You will use it once to make yourself a bot admin.
+4. Save. Render redeploys by itself.
+5. Open your service URL (`https://<your-service>.onrender.com`), click **Open admin panel**, and log in.
+6. If WhatsApp shows "not connected", click **Scan WhatsApp QR code** and scan it from the spare bot phone (Settings, Linked devices). This is only needed once.
+7. In the admin panel, copy the `!claim ...` message and send it to the bot in a private WhatsApp chat. You are now an admin.
+8. Add the bot number to your groups. In each group, send `!setgroup <role>` (for example `!setgroup cyber`). Roles: announcements, open_chat, cyber, help, distro, projects. You can also do this from the admin panel.
+9. Optional: paste an AI key (Groq, OpenRouter, Gemini) in the admin panel to switch on `!ask`.
+
+## Everyday use
+
+- `!status` shows whether the bot is healthy and which groups are set up.
+- `!pause` inside a group makes the bot silent there (`!resume` undoes it). `!pause all` in a private chat silences everything.
+- `!adminhelp` lists the admin commands. Normal members never see them.
+
+## If something is wrong
+
+- **Bot does not answer:** check the admin panel for "Connected". If not, re-scan the QR code.
+- **Cannot log in:** check `ADMIN_PASSWORD` in Render. After changing it, wait for the redeploy.
+- **`!claim` says the code is invalid:** it must match `PAIR_TOKEN` exactly. The admin panel shows the current one.
+- **Render free plan sleeps** after 15 minutes without web traffic. Point a free uptime monitor (UptimeRobot, cron-job.org) at `/health` every 5 minutes.
+
+## For developers
 
 ```bash
 cp .env.example .env
 npm install
-npm run check
 npm test
 npm start
 ```
 
-The service exposes `GET /health` on `PORT`. In development, scan the printed Baileys QR. For production, replace `useMultiFileAuthState('.qr')` in `src/index.js` with an encrypted Supabase-backed auth adapter before pairing.
+Optional: `node scripts/hash-pass.js "passphrase"` prints a hash you can use as `ADMIN_PASSWORD_HASH` instead of the plain password.
 
-Apply `supabase/schema.sql` in Supabase, then create the six group rows with stable WhatsApp group IDs. Production additionally enables RLS on every table and requires the private `SUPABASE_BOT_SECRET` header gate. Do not use display names as identifiers; names change and are not unique.
-
-## Build phases
-
-### Phase 0: hardening before real traffic
-
-- Rotate the generated bot secret and auth-encryption key through Render if compromise is suspected; rotate auth only after planning a re-pair migration.
-- Add message receipt idempotency (`message_id` unique) before any side effect.
-- Add structured DB repositories with explicit timeouts and bounded queries.
-- Add a real scheduler based on persisted leases: `job_key`, `run_after`, `lease_until`, `attempts`, `last_error`.
-- Add a circuit breaker per AI provider and a global daily budget.
-- Add integration tests using a fake socket and a test Supabase project.
-
-### Phase 1: moderation and permissions
-
-- Stable member hashing with a server-side pepper; rotate only with a migration plan.
-- Role lookup from the database on every privileged action, with short cache TTL.
-- Anti-link, flood, repeat-message, warning decay, appeal, and group pause.
-- All destructive actions require capability checks, an idempotency key, and an audit row. If the bot lacks WhatsApp admin privileges, explain once and stop retrying.
-
-### Phase 2: community features
-
-- XP ledger with per-user/per-group cooldowns and a daily ceiling.
-- Rank calculations derived from the ledger, not hand-edited counters.
-- One active question per group enforced by a database constraint/transaction.
-- Onboarding only after a member starts a DM or an administrator explicitly launches a small batch.
-
-### Phase 3: AI and CTF
-
-- AI is invoked only for explicit commands, approved unanswered Help tickets, or scheduled content generation.
-- Normalize/hash requests for short-lived cache; never cache private screenshots or sensitive support content.
-- CTF flags are compared as salted hashes; never store plaintext flags. Do not put answers in group messages.
-- Hints and challenge release use persisted timestamps and a single scheduler lease.
-
-### Phase 4: adaptation and extras
-
-- Measure replies and reactions, not just messages sent.
-- Change one posting variable at a time and require a minimum sample size before adapting.
-- Use fatigue rules with cooldowns and an admin override. Never let “quiet detection” bypass the daily cap.
-- Add anonymous questions, mentor matching, installation requests, and vision support only after privacy review and abuse handling are tested.
-
-## Loop and failure controls
-
-- **Reconnect loop:** exponential backoff with jitter, one pending reconnect timer, no reconnect after `loggedOut`.
-- **Message loop:** ignore `fromMe`, process each message ID once, and never react to the bot's own generated messages.
-- **Scheduler loop:** one lease per job key, bounded attempts, persisted next-run time, and a dead-letter state for repeated failures.
-- **AI retry loop:** at most one retry per request, provider cooldown, global queue cap, and no retry for policy refusal or invalid input.
-- **Moderation loop:** a warning or deletion action is idempotent; failure is recorded and not immediately retried.
-- **DM loop:** member verification cache has an expiry; no repeated onboarding questions; explicit opt-out is respected everywhere.
-
-## Acceptance criteria
-
-- Restarting the process does not duplicate a welcome, warning, XP award, scheduled post, or CTF solve.
-- A temporary Supabase outage leaves the bot in a safe read-only/degraded mode rather than sending uncontrolled messages.
-- A provider outage drains gracefully and never exceeds configured per-provider or global budgets.
-- Every privileged action has an audit record with actor, target, action, timestamp, and result.
-- The bot stays silent when silence is safer: unknown commands, non-members in DMs, empty cleaned responses, full queues, paused groups, and failed capability checks.
-- All public bot output passes the cleaner and length cap; no provider names, prompts, keys, stack traces, or reasoning blocks are exposed.
-- A human admin can pause a group, disable AI, disable all scheduled posts, and recover from a bad deployment without database surgery.
-
-## Deployment
-
-Render runs one Node web service with the health endpoint monitored externally. The live service has `SUPABASE_URL`, `SUPABASE_API_KEY`, `SUPABASE_BOT_SECRET`, and `AUTH_ENCRYPTION_KEY` configured as environment variables. Supabase RLS is enabled on every bot table, and the bot's encrypted auth-state adapter has been exercised end-to-end against the live project. Keep a rollback copy of the previous deploy and test reconnects after every deployment.
-
-The original plan's “all free tiers” assumption is not a reliability guarantee. Provider quotas, WhatsApp enforcement, Render behavior, and Supabase limits change. Treat each as a budget with alerts and a safe fallback, not as unlimited capacity.
+WhatsApp login data is encrypted (AES-256-GCM) before it is stored in Supabase. Apply `supabase/schema.sql` to a new Supabase project before first run.
