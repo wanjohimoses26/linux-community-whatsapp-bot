@@ -10,7 +10,9 @@ A WhatsApp bot for the Linux community groups. It runs on Render, keeps its data
 | Admin web page (connect WhatsApp, assign groups, add AI keys) | Working |
 | `!ask`, `!start`, `!privacy`, `!help` | Working |
 | Admin commands: `!status`, `!setgroup`, `!pause`, `!resume` | Working |
-| Moderation (anti-link, flood, warnings), welcome messages | Not built yet |
+| Welcome messages for new members (`!welcome on/off`, `!setwelcome`) | Working |
+| Human-paced replies (typing indicator, short pauses, one message at a time) | Working |
+| Moderation (anti-link, flood, warnings) | Not built yet |
 | XP and ranks, daily questions, CTF, recaps | Not built yet |
 
 The database tables for the not-built features already exist in `supabase/schema.sql`.

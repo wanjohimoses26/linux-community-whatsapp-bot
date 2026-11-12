@@ -9,7 +9,7 @@ import { LoopGuard } from './core/loop-guard.js';
 import { cleanWhatsApp } from './core/cleaner.js';
 import { useSupabaseAuthState } from './core/supabase-auth.js';
 import { createSettingsStore } from './core/settings.js';
-import { createAdminList, messageIds } from './core/admins.js';
+import { createAdminList, messageIds, normalizeJid } from './core/admins.js';
 import { ProviderRouter } from './ai/providers.js';
 import { checkPassword, safeEqual, cookieHeader, cookieName, issueSession, parseCookies, validSession, clearCookieHeader } from './core/web-auth.js';
 
@@ -44,6 +44,32 @@ const settingsStore = config.supabaseEnabled && config.AUTH_ENCRYPTION_KEY
 const aiRouter = settingsStore ? new ProviderRouter({ settings: settingsStore, logger }) : null;
 const admins = createAdminList({ settings: settingsStore, envJids: [...config.adminJids, config.OWNER_JID], logger });
 const paused = new Set(); // group JIDs, or 'ALL'
+const welcomeOff = new Set(); // groups where welcome messages are switched off
+const welcomeText = new Map(); // group JID -> custom welcome text
+
+// Human-paced sending: one message at a time, with a short "reading" pause, a typing indicator and a gap afterwards.
+// This keeps the bot from firing replies instantly, which is a common trigger for WhatsApp's automation checks.
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const jitter = (min, max) => min + Math.floor(Math.random() * (max - min));
+let sendChain = Promise.resolve();
+let pendingSends = 0;
+function sendHuman(jid, text, mentions) {
+  if (pendingSends >= 15) { logger.warn('send queue full; dropping a message'); return Promise.resolve(); }
+  pendingSends += 1;
+  const job = sendChain.then(async () => {
+    if (!socket || lastConnection !== 'open') return;
+    try {
+      await sleep(jitter(800, 1800));
+      await socket.sendPresenceUpdate('composing', jid);
+      await sleep(Math.min(7_000, 1_000 + text.length * 40) + jitter(0, 800));
+      await socket.sendPresenceUpdate('paused', jid);
+      await socket.sendMessage(jid, mentions?.length ? { text, mentions } : { text });
+      await sleep(jitter(1_500, 3_000));
+    } catch (err) { logger.warn({ err }, 'send failed'); }
+  }).finally(() => { pendingSends -= 1; });
+  sendChain = job.catch(() => {});
+  return job;
+}
 
 const roleNames = ['announcements', 'open_chat', 'cyber', 'help', 'distro', 'projects'];
 const providerNames = ['groq', 'openrouter', 'gemini', 'kilo'];
@@ -51,8 +77,11 @@ const roleLabel = (role) => role.replace('_', ' ');
 
 async function loadPaused() {
   if (!settingsStore) return;
-  try { for (const [key, value] of Object.entries(await settingsStore.list('paused'))) if (value) paused.add(key); }
-  catch (err) { logger.warn({ err }, 'could not load paused groups'); }
+  try {
+    for (const [key, value] of Object.entries(await settingsStore.list('paused'))) if (value) paused.add(key);
+    for (const [key, value] of Object.entries(await settingsStore.list('welcome_off'))) if (value) welcomeOff.add(key);
+    for (const [key, value] of Object.entries(await settingsStore.list('welcome_text'))) if (value) welcomeText.set(key, String(value));
+  } catch (err) { logger.warn({ err }, 'could not load saved group settings'); }
 }
 async function setPaused(key, value) {
   if (value) paused.add(key); else paused.delete(key);
@@ -161,7 +190,7 @@ router.command('claim', async ({ args, send, isGroup, sender, ids }) => {
   try { await admins.add(ids); } catch (err) { logger.error({ err }, 'could not save admin'); return send('I could not save that. Try again in a minute.'); }
   return send('Done, you are an admin. Send !adminhelp to see what you can do.');
 });
-router.command('adminhelp', async ({ send }) => send(`*Admin commands*\n!status - how the bot is doing\n!setgroup <role> - run inside a group. Roles: ${roleNames.join(', ')}\n!pause / !resume - run inside a group to silence the bot there\n!pause all / !resume all - in a private chat, for every group`), { adminOnly: true });
+router.command('adminhelp', async ({ send }) => send(`*Admin commands*\n!status - how the bot is doing\n!setgroup <role> - run inside a group. Roles: ${roleNames.join(', ')}\n!pause / !resume - run inside a group to silence the bot there\n!pause all / !resume all - in a private chat, for every group\n!welcome on|off - run inside a group\n!setwelcome <text> - custom welcome, use {names} to tag new members`), { adminOnly: true });
 router.command('status', async ({ send }) => {
   let mapped = {}; let keys = {};
   try { if (settingsStore) { mapped = await settingsStore.list('group_map'); keys = await settingsStore.list('ai_keys'); } } catch { /* shown as empty */ }
@@ -182,6 +211,27 @@ const pauseHandler = (value) => async ({ args, send, isGroup, jid }) => {
   try { await setPaused(all ? 'ALL' : jid, value); } catch (err) { logger.error({ err }, 'pause change failed'); return send('I could not save that. Try again in a minute.'); }
   return send(value ? 'Okay, I will stay quiet there. Admins can still use commands. Send !resume to undo.' : 'Back on.');
 };
+router.command('welcome', async ({ args, send, isGroup, jid }) => {
+  if (!isGroup) return send('Send this inside the group, for example: !welcome off');
+  const choice = args.trim().toLowerCase();
+  if (!['on', 'off'].includes(choice)) return send(`Welcome messages are ${welcomeOff.has(jid) ? 'off' : 'on'} here. Use !welcome on or !welcome off.`);
+  try {
+    if (settingsStore) await settingsStore.set('welcome_off', jid, choice === 'off');
+    if (choice === 'off') welcomeOff.add(jid); else welcomeOff.delete(jid);
+  } catch (err) { logger.error({ err }, 'welcome toggle failed'); return send('I could not save that. Try again in a minute.'); }
+  return send(`Welcome messages are now ${choice} in this group.`);
+}, { adminOnly: true });
+router.command('setwelcome', async ({ args, send, isGroup, jid }) => {
+  if (!isGroup) return send('Send this inside the group, for example: !setwelcome Welcome {names}! Please read the pinned rules.');
+  const text = args.trim();
+  if (!text) return send('Write your welcome text after the command. Use {names} where the new members should be tagged. Send !setwelcome reset to go back to the default.');
+  const reset = text.toLowerCase() === 'reset';
+  try {
+    if (settingsStore) await settingsStore.set('welcome_text', jid, reset ? '' : text.slice(0, 600));
+    if (reset) welcomeText.delete(jid); else welcomeText.set(jid, text.slice(0, 600));
+  } catch (err) { logger.error({ err }, 'setwelcome failed'); return send('I could not save that. Try again in a minute.'); }
+  return send(reset ? 'Back to the default welcome message.' : 'Saved. New members will get your welcome message.');
+}, { adminOnly: true });
 router.command('pause', pauseHandler(true), { adminOnly: true });
 router.command('resume', pauseHandler(false), { adminOnly: true });
 
@@ -210,6 +260,20 @@ async function connect() {
       clearTimeout(reconnectTimer);
       reconnectTimer = setTimeout(connect, delay);
     });
+    socket.ev.on('group-participants.update', async ({ id, participants, action }) => {
+      try {
+        if (action !== 'add' || paused.has('ALL') || paused.has(id) || welcomeOff.has(id)) return;
+        const me = normalizeJid(socket?.user?.id || '');
+        const joined = (participants || []).map((p) => (typeof p === 'string' ? p : p?.id || p?.phoneNumber)).filter((p) => p && normalizeJid(p) !== me);
+        if (!joined.length) return;
+        const names = joined.slice(0, 5).map((p) => `@${normalizeJid(p)}`).join(', ');
+        const custom = welcomeText.get(id);
+        const text = custom
+          ? (custom.includes('{names}') ? custom.replaceAll('{names}', names) : `${names} ${custom}`)
+          : `Welcome ${names}! I'm ${config.BOT_NAME}, the community bot. Say hi and tell us what you're learning. Send !help to see what I can do.`;
+        await sendHuman(id, text, joined.slice(0, 5));
+      } catch (error) { logger.error({ err: error }, 'welcome message failed'); }
+    });
     socket.ev.on('messages.upsert', async ({ messages }) => {
       for (const message of messages) {
         try { await handleMessage(message); } catch (error) { logger.error({ err: error }, 'message handling failed'); }
@@ -233,8 +297,9 @@ async function handleMessage(message) {
   const send = async (textToSend) => {
     if (!textToSend || !socket) return;
     const cleaned = cleanWhatsApp(textToSend, { maxChars: config.MAX_MESSAGE_CHARS });
-    if (cleaned) await socket.sendMessage(jid, { text: cleaned });
+    if (cleaned) await sendHuman(jid, cleaned);
   };
+  if (text.startsWith('!')) socket?.readMessages?.([message.key]).catch(() => {});
   await router.dispatch({ text, jid, sender, ids, isGroup, isAdmin, send, message });
 }
 
